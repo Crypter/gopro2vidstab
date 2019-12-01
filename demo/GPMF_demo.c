@@ -26,7 +26,9 @@
 
 #include "../GPMF_parser.h"
 #include "GPMF_mp4reader.h"
+#include "anglemath.hpp"
 
+#define DEBUG 0
 
 extern void PrintGPMF(GPMF_stream *ms);
 
@@ -46,61 +48,56 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-#if 1 // Search for GPMF Track
 	size_t mp4 = OpenMP4Source(argv[1], MOV_GPMF_TRAK_TYPE, MOV_GPMF_TRAK_SUBTYPE);
-#else // look for a global GPMF payload in the moov header, within 'udta'
-	size_t mp4 = OpenMP4SourceUDTA(argv[1]);  //Search for GPMF payload with MP4's udta 
-#endif
+
 	if (mp4 == 0)
 	{
 		printf("error: %s is an invalid MP4/MOV or it has no GPMF data\n", argv[1]);
 		return -1;
 	}
 
-
 	metadatalength = GetDuration(mp4);
 
 	if (metadatalength > 0.0)
 	{
 		uint32_t index, payloads = GetNumberPayloads(mp4);
-//		printf("found %.2fs of metadata, from %d payloads, within %s\n", metadatalength, payloads, argv[1]);
+		if (DEBUG) printf("found %.2fs of metadata, from %d payloads, within %s\n", metadatalength, payloads, argv[1]);
 
 		uint32_t fr_num, fr_dem;
 		uint32_t frames = GetVideoFrameRateAndCount(mp4, &fr_num, &fr_dem);
+		double gyro_offset, gyro_end;
+		uint32_t current_image_frame=0, current_gyro_frame=0;
+		frame_modifier_t frame_adjustments[4];
+		angles_t current_angles, previous_angles;
+		
+		//GoPro Hero 6, pixel per radian: 1820
+		/*frame_adjustments[0].original.set_cartesian(960, 540);
+		frame_adjustments[1].original.set_cartesian(960, 1620);
+		frame_adjustments[2].original.set_cartesian(2880, 540);
+		frame_adjustments[3].original.set_cartesian(2880, 1620);*/
+		
+		frame_adjustments[0].original.set_cartesian(480*2, 270*2);
+		frame_adjustments[1].original.set_cartesian(-480*2, 270*2);
+		frame_adjustments[2].original.set_cartesian(480*2, -270*2);
+		frame_adjustments[3].original.set_cartesian(-480*2, -270*2); //960+540
+		
+		frame_adjustments[0].reset();
+		frame_adjustments[1].reset();
+		frame_adjustments[2].reset();
+		frame_adjustments[3].reset();
+
+		double gyro_rate = GetGPMFSampleRate(mp4, STR2FOURCC("GYRO"), GPMF_SAMPLE_RATE_PRECISE, &gyro_offset, &gyro_end);// GPMF_SAMPLE_RATE_FAST);
+        gyro_offset+=(0.02*3);
 		if (frames)
 		{
-			printf("video framerate is %.2f with %d frames\n", (float)fr_num/(float)fr_dem, frames);
+			if (DEBUG) printf("video framerate is %.2f with %d frames\n", (float)fr_num/(float)fr_dem, frames);
+			if (DEBUG) printf("GYRO samplerate is %.2f with duration of %lf s\n", (float)gyro_rate, gyro_end-gyro_offset);
+			if (DEBUG) printf("GYRO OFFSET: %lf s\n", gyro_offset);
 		}
-#if 1
-		if (payloads == 1) // Printf the contents of the single payload
-		{
-			uint32_t payloadsize = GetPayloadSize(mp4,0);
-			payload = GetPayload(mp4, payload, 0);
-			if(payload == NULL)
-				goto cleanup;
+		//current_image_frame = gyro_offset * ((float)fr_num/(float)fr_dem);
 
-			ret = GPMF_Init(ms, payload, payloadsize);
-			if (ret != GPMF_OK)
-				goto cleanup;
-
-			// Output (printf) all the contained GPMF data within this payload
-			ret = GPMF_Validate(ms, GPMF_RECURSE_LEVELS); // optional
-			if (GPMF_OK != ret)
-			{
-				printf("Invalid Structure\n");
-				goto cleanup;
-			}
-
-			GPMF_ResetState(ms);
-			do
-			{
-				PrintGPMF(ms);  // printf current GPMF KLV
-			} while (GPMF_OK == GPMF_Next(ms, GPMF_RECURSE_LEVELS));
-			GPMF_ResetState(ms);
-			printf("\n");
-
-		}
-#endif
+		printf("VID.STAB 1\r\n");
+		//printf("Frame 1 (List 0 [])\r\n");
 
 
 		for (index = 0; index < payloads; index++)
@@ -119,104 +116,8 @@ int main(int argc, char *argv[])
 			if (ret != GPMF_OK)
 				goto cleanup;
 
-#if 1		// Find all the available Streams and the data carrying FourCC
-			if (index == 0) // show first payload 
-			{
-				GPMF_stream find;
-				GPMF_CopyState(ms, &find);
-				//SHUT should be preset in all GoPro files, if STMP and SHUT are both present, additional sync precision can be obtained.
-				if (GPMF_OK == GPMF_FindNext(&find, GPMF_KEY_TIME_STAMP, GPMF_RECURSE_LEVELS))
-				{
-					double payload_in = 0.0, payload_out;
-					double start = 0.0, end;
 
-					GetPayloadTime(mp4, 0, &payload_in, &payload_out); 
-					
-					if (GPMF_OK == GPMF_FindNext(&find, STR2FOURCC("SHUT"), GPMF_RECURSE_LEVELS))
-					{
-						//if SHUT contains TMSP (timestamps) very more  precision sync with video data can be achieved
-						if (GPMF_OK == GPMF_FindPrev(&find, GPMF_KEY_TIME_STAMP, GPMF_CURRENT_LEVEL))
-						{
-							double rate = GetGPMFSampleRate(mp4, STR2FOURCC("SHUT"), GPMF_SAMPLE_RATE_PRECISE, &start, &end);// GPMF_SAMPLE_RATE_FAST);
-							start_offset = start - payload_in;
-						}
-					}
-				}
-
-
-				ret = GPMF_FindNext(ms, GPMF_KEY_STREAM, GPMF_RECURSE_LEVELS);
-				while (GPMF_OK == ret)
-				{
-					ret = GPMF_SeekToSamples(ms);
-					if (GPMF_OK == ret) //find the last FOURCC within the stream
-					{
-						uint32_t key = GPMF_Key(ms);
-						GPMF_SampleType type = GPMF_Type(ms);
-						uint32_t elements = GPMF_ElementsInStruct(ms);
-						//uint32_t samples = GPMF_Repeat(ms);
-						uint32_t samples = GPMF_PayloadSampleCount(ms);
-
-						if (samples)
-						{
-							printf("  STRM of %c%c%c%c ", PRINTF_4CC(key));
-
-							if (type == GPMF_TYPE_COMPLEX)
-							{
-								GPMF_stream find_stream;
-								GPMF_CopyState(ms, &find_stream);
-
-								if (GPMF_OK == GPMF_FindPrev(&find_stream, GPMF_KEY_TYPE, GPMF_CURRENT_LEVEL))
-								{
-									char tmp[64];
-									char *data = (char *)GPMF_RawData(&find_stream);
-									int size = GPMF_RawDataSize(&find_stream);
-
-									if (size < sizeof(tmp))
-									{
-										memcpy(tmp, data, size);
-										tmp[size] = 0;
-										printf("of type %s ", tmp);
-									}
-								}
-
-							}
-							else
-							{
-								printf("of type %c ", type);
-							}
-
-							printf("with %d sample%s ", samples, samples > 1 ? "s" : "");
-
-							if (elements > 1)
-								printf("-- %d elements per sample", elements);
-
-							printf("\n");
-						}
-
-						ret = GPMF_FindNext(ms, GPMF_KEY_STREAM, GPMF_RECURSE_LEVELS);
-					}
-					else
-					{
-						if (ret == GPMF_ERROR_BAD_STRUCTURE) // some payload element was corrupt, skip to the next valid GPMF KLV at the previous level.
-						{
-							ret = GPMF_Next(ms, GPMF_CURRENT_LEVEL); // this will be the next stream if any more are present.
-						}
-					}
-				}
-				GPMF_ResetState(ms);
-				printf("\n");
-			}
-#endif 
-
-
-
-
-#if 1		// Find GPS values and return scaled doubles. 
-			if (index == 0) // show first payload 
-			{
-		//		if (GPMF_OK == GPMF_FindNext(ms, STR2FOURCC("GPS5"), GPMF_RECURSE_LEVELS) || //GoPro Hero5/6/7 GPS
-			//		GPMF_OK == GPMF_FindNext(ms, STR2FOURCC("GPRI"), GPMF_RECURSE_LEVELS))   //GoPro Karma GPS
-				if (GPMF_OK == GPMF_FindNext(ms, STR2FOURCC("ACCL"), GPMF_RECURSE_LEVELS)) //GoPro Hero5/6/7 Accelerometer
+				if (GPMF_OK == GPMF_FindNext(ms, STR2FOURCC("GYRO"), GPMF_RECURSE_LEVELS)) //GoPro Hero5/6/7 Accelerometer
 				{
 					uint32_t key = GPMF_Key(ms);
 					uint32_t samples = GPMF_Repeat(ms);
@@ -227,7 +128,7 @@ int main(int argc, char *argv[])
 					char units[10][6] = { "" };
 					uint32_t unit_samples = 1;
 
-					printf("MP4 Payload time %.3f to %.3f seconds\n", in, out);
+					if (DEBUG) printf("MP4 Payload time %.3f to %.3f seconds\n", in, out);
 
 					if (tmpbuffer && samples)
 					{
@@ -256,22 +157,58 @@ int main(int argc, char *argv[])
 						ptr = tmpbuffer;
 						for (i = 0; i < samples; i++)
 						{
-							printf("%c%c%c%c ", PRINTF_4CC(key));
-							for (j = 0; j < elements; j++)
-								printf("%.3f%s, ", *ptr++, units[j%unit_samples]);
+							if (DEBUG) printf("Image frame: %d - ", (int)((gyro_offset+((float)current_gyro_frame/gyro_rate)) * ((float)fr_num/(float)fr_dem)) );
+							while (current_image_frame < (int)((gyro_offset+((float)current_gyro_frame/gyro_rate)) * ((float)fr_num/(float)fr_dem)) ){
+								printf("Frame %d (List 4 [", ++current_image_frame);
+								for (int k=0; k<4; k++){
+									//LocalMotions ::= List [(LM v.x v.y f.x f.y f.size contrast match),...]
+									printf("(LM %d %d %d %d 128 0.8 0.01)",
+										(int)round(frame_adjustments[k].original.x - frame_adjustments[k].adjust.x),
+										(int)round(frame_adjustments[k].original.y - frame_adjustments[k].adjust.y),
+										(int)round(frame_adjustments[k].original.x + 960*2),
+										(int)round(frame_adjustments[k].original.y + 540*2) );
+										if (k<3) printf(",");
 
-							printf("\n");
+									frame_adjustments[k].reset();
+								}
+								printf("])\r\n");
+							}
+							if (DEBUG>1) printf("GYRODATA: %d - ", current_gyro_frame);
+							if (DEBUG>1) printf("%c%c%c%c ", PRINTF_4CC(key));
+							
+								if (DEBUG>1) printf("%.10f%s, %.10f%s, %.10f%s\n", *ptr, units[0], *(ptr+1), units[0], *(ptr+2), units[0]);
+								current_angles.x = (*(ptr)); //plus pan
+								current_angles.y = -(*(ptr+1)); //minus tilt
+								current_angles.z = -(*(ptr+2)); // ?! roll
+								
+								for (int k=0; k<4; k++){
+									
+									frame_adjustments[k].adjust.set_cartesian(
+										frame_adjustments[k].adjust.x + current_angles.x*((1920*2*(180/118.2))/3.14)*(1/gyro_rate), 
+										frame_adjustments[k].adjust.y + current_angles.y*((1920*2*(180/118.2))/3.14)*(1/gyro_rate));
+										
+									
+									frame_adjustments[k].adjust.set_polar(
+										frame_adjustments[k].adjust.r,
+										frame_adjustments[k].adjust.t + current_angles.z*(1/gyro_rate));
+										
+								}
+
+								ptr+=3;
+							//check if we should start a new frame
+
+							current_gyro_frame++;
+							if (DEBUG>1) printf("\n");
+
 						}
 						free(tmpbuffer);
 					}
 				}
 				GPMF_ResetState(ms);
-				printf("\n");
-			}
-#endif 
+				if (DEBUG) printf("\n");
 		}
 
-#if 1
+#if 0
 		// Find all the available Streams and compute they sample rates
 		while (GPMF_OK == GPMF_FindNext(ms, GPMF_KEY_STREAM, GPMF_RECURSE_LEVELS))
 		{
@@ -281,8 +218,6 @@ int main(int argc, char *argv[])
 				uint32_t fourcc = GPMF_Key(ms);
 				double rate = GetGPMFSampleRate(mp4, fourcc, GPMF_SAMPLE_RATE_PRECISE, &start, &end);// GPMF_SAMPLE_RATE_FAST);
 
-				start -= start_offset;
-				end -= start_offset;
 				printf("%c%c%c%c sampling rate = %fHz (time %f to %f)\",\n", PRINTF_4CC(fourcc), rate, start, end);
 			}
 		}
